@@ -1591,6 +1591,32 @@ mod tests {
     }
 
     #[test]
+    fn exclude_max_events_per_span() {
+        let tracer = TestTracer(Arc::new(Mutex::new(None)));
+        let subscriber = tracing_subscriber::registry()
+            .with(layer().with_tracer(tracer.clone()));
+        let subscriber = Arc::new(subscriber);
+
+        tracing::subscriber::with_default(subscriber.clone(), || {
+            let span = tracing::debug_span!("request");
+            let _span_guard = span.enter();
+
+            // record one event
+            tracing::info!("event 1");
+
+            let data = span.id().and_then(|id| subscriber.span(&id)).unwrap();
+            let extensions = data.extensions();
+
+            // it should immediately get dropped
+            assert!(extensions.get::<DroppedOtelEvents>().is_none());
+        });
+
+        // on close we should not report the number of events we dropped, because no max was set
+        let attributes = tracer.with_data(|data| data.builder.attributes.as_ref().unwrap().clone());
+        assert!(!attributes.contains_key(&Key::new("dropped_event_count")));
+    }
+
+    #[test]
     fn max_events_per_span_one() {
         let tracer = TestTracer(Arc::new(Mutex::new(None)));
         let subscriber = tracing_subscriber::registry()
