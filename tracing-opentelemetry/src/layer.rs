@@ -1593,8 +1593,7 @@ mod tests {
     #[test]
     fn exclude_max_events_per_span() {
         let tracer = TestTracer(Arc::new(Mutex::new(None)));
-        let subscriber = tracing_subscriber::registry()
-            .with(layer().with_tracer(tracer.clone()));
+        let subscriber = tracing_subscriber::registry().with(layer().with_tracer(tracer.clone()));
         let subscriber = Arc::new(subscriber);
 
         tracing::subscriber::with_default(subscriber.clone(), || {
