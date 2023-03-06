@@ -1,3 +1,5 @@
+use std::convert::TryFrom;
+
 use crate::{OtelData, PreSampledTracer};
 use once_cell::unsync;
 use opentelemetry::{
@@ -102,16 +104,11 @@ impl WithContext {
 struct DroppedOtelEvents {
     // how many events we've dropped thus far
     dropped_count: usize,
-    // have we reported that events have been dropped
-    reported: bool,
 }
 
 impl DroppedOtelEvents {
     fn new() -> Self {
-        DroppedOtelEvents {
-            dropped_count: 0,
-            reported: false,
-        }
+        DroppedOtelEvents { dropped_count: 0 }
     }
 
     fn add_dropped(&mut self, additional_count: usize) {
@@ -968,19 +965,6 @@ where
             match (dropped_events, extensions.get_mut::<DroppedOtelEvents>()) {
                 (Some(additional_dropped), Some(current_dropped)) => {
                     current_dropped.add_dropped(additional_dropped);
-
-                    // report, once per span, when we drop events
-                    if !current_dropped.reported {
-                        let id = span.id().into_u64();
-                        let name = span.name();
-                        let module = span.metadata().module_path();
-                        let line = span.metadata().line();
-
-                        tracing::error!(
-                            "Dropped events for span({id}) named: {name} at {module:?}:{line:?}"
-                        );
-                        current_dropped.reported = true;
-                    }
                 }
                 (Some(additional_dropped), None) => {
                     let mut count = DroppedOtelEvents::new();
@@ -1016,6 +1000,20 @@ where
                     } else {
                         builder.attributes = Some(OrderMap::from_iter([busy_ns, idle_ns]));
                     }
+                }
+            }
+
+            // Report the number of events that were dropped, if we dropped any
+            if let Some(DroppedOtelEvents { dropped_count }) =
+                extensions.remove::<DroppedOtelEvents>()
+            {
+                let k = Key::from_static_str("dropped_event_count");
+                let v = Value::I64(i64::try_from(dropped_count).unwrap_or(i64::MAX));
+
+                if let Some(ref mut attributes) = builder.attributes {
+                    attributes.insert(k, v);
+                } else {
+                    builder.attributes = Some(OrderMap::from_iter([KeyValue::new(k, v)]));
                 }
             }
 
@@ -1549,6 +1547,13 @@ mod tests {
             // should still be small
             assert_eq!(otel_events.capacity(), 8);
         });
+
+        // on close we should report the number of events we dropped
+        let attributes = tracer.with_data(|data| data.builder.attributes.as_ref().unwrap().clone());
+        let dropped_count_value = attributes.get(&Key::new("dropped_event_count")).unwrap();
+        let dropped_count: i64 = dropped_count_value.as_str().parse().unwrap();
+
+        assert_eq!(dropped_count, 96);
     }
 
     #[test]
@@ -1576,6 +1581,13 @@ mod tests {
             let otel_events = otel_data.builder.events.as_ref().unwrap();
             assert!(otel_events.is_empty());
         });
+
+        // on close we should report the number of events we dropped
+        let attributes = tracer.with_data(|data| data.builder.attributes.as_ref().unwrap().clone());
+        let dropped_count_value = attributes.get(&Key::new("dropped_event_count")).unwrap();
+        let dropped_count: i64 = dropped_count_value.as_str().parse().unwrap();
+
+        assert_eq!(dropped_count, 1);
     }
 
     #[test]
@@ -1621,5 +1633,28 @@ mod tests {
             let otel_events = otel_data.builder.events.as_ref().unwrap();
             assert_eq!(otel_events.len(), 1);
         });
+
+        // on close we should report the number of events we dropped
+        let attributes = tracer.with_data(|data| data.builder.attributes.as_ref().unwrap().clone());
+        let dropped_count_value = attributes.get(&Key::new("dropped_event_count")).unwrap();
+        let dropped_count: i64 = dropped_count_value.as_str().parse().unwrap();
+
+        assert_eq!(dropped_count, 1);
+    }
+
+    #[test]
+    fn max_events_enabled_not_exceeding_max() {
+        let tracer = TestTracer(Arc::new(Mutex::new(None)));
+        let subscriber = tracing_subscriber::registry()
+            .with(layer().with_tracer(tracer.clone()).max_events_per_span(32));
+        let subscriber = Arc::new(subscriber);
+
+        tracing::subscriber::with_default(subscriber.clone(), || {
+            tracing::debug_span!("request");
+        });
+
+        // we didn't exceed our max, so we shouldn't report anything
+        let attributes = tracer.with_data(|data| data.builder.attributes.as_ref().unwrap().clone());
+        assert!(!attributes.contains_key(&Key::new("dropped_event_count")));
     }
 }
